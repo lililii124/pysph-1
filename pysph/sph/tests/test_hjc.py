@@ -207,3 +207,56 @@ def test_compiled_plane_strain_retains_out_of_plane_stress():
     assert pa.q[0] == pytest.approx(.4)
     assert pa.s22[0] == pytest.approx(2. / 15.)
     assert pa.damage[0] == 0
+
+
+def test_taylor_plane_contact_matches_elastic_particle_rebound():
+    from pysph.examples.solid_mech.hjc_taylor_bar import RigidPlaneContact
+
+    # An isolated particle reaches the plane at t=.01, spends pi/100 in
+    # harmonic contact, then leaves with its initial speed and no friction.
+    errors = []
+    for dt in (1e-4, 5e-5):
+        pa = particles()
+        pa.z[:] = .06
+        pa.w[:] = -1.
+        pa.u[:] = 2.
+        pa.add_property('wall_acceleration')
+        kernel = CubicSpline(dim=3)
+        integrator = EPECIntegrator(solid=HJCStep())
+        equations = [Group([HookesDeviatoricStressRate('solid', None)]),
+                     Group([ClearAcceleration('solid', None)]),
+                     Group([RigidPlaneContact('solid', None, .1, 1e4)])]
+        evaluator = AccelerationEval([pa], equations, kernel, backend='cython')
+        SPHCompiler(evaluator, integrator).compile()
+        nnps = LinkedListNNPS(dim=3, particles=[pa])
+        evaluator.set_nnps(nnps)
+        integrator.set_nnps(nnps)
+        impulse, penetration, error = 0., 0., 0.
+        for i in range(round(.06/dt)):
+            integrator.step(i*dt, dt)
+            assert pa.wall_acceleration[0] >= 0
+            impulse += dt * pa.wall_acceleration[0]
+            penetration = max(penetration, .05-pa.z[0])
+            time = (i+1)*dt
+            # Measure order inside smooth contact; the discrete release
+            # event can make individual final-state errors nonmonotone.
+            if .01 < time < .035:
+                theta = 100*(time-.01)
+                error = max(error, abs(pa.w[0]+np.cos(theta))
+                            + 100*abs(pa.z[0]-(.05-.01*np.sin(theta))))
+        exact_z = .05 + .06 - (.01 + np.pi/100)
+        errors.append(error)
+        assert pa.z[0] == pytest.approx(exact_z, abs=2e-6)
+        assert pa.w[0] == pytest.approx(1., abs=3e-5)
+        assert pa.u[0] == 2.
+        assert penetration == pytest.approx(.01, abs=2e-6)
+        assert impulse == pytest.approx(pa.w[0]+1., abs=1e-12)
+        assert pa.damage[0] == 0
+    assert errors[1] < .4 * errors[0]
+
+
+class ClearAcceleration(Equation):
+    def initialize(self, d_idx, d_au, d_av, d_aw):
+        d_au[d_idx] = 0.
+        d_av[d_idx] = 0.
+        d_aw[d_idx] = 0.
